@@ -1,0 +1,112 @@
+# LIBRERÍAS
+import pandas as pd
+import requests
+import geopandas as gpd
+from shapely.geometry import Polygon
+import folium
+import time
+
+# DIRECTORIOS
+dir_path = 'D:/Users/aracely.sanchez/Documents'
+data_path = 'C:/Users/lingu/Documents/esc_primaria.csv'
+
+# CARGAR LOS DATOS
+escuelas = pd.read_csv(data_path)
+
+# FUNCIÓN PARA HACER SOLICITUDES A LA API MAPBOX ISOCHRONES
+def mapbox_isochrone(base_url, routing_profile, lon, lat, mins=None, meters=None, access_token=None):
+    """
+    Realiza una solicitud a la API Mapbox Isochrones y devuelve un GeoDataFrame con los vértices de la isócrona.
+    """
+    # Construye la URL de la solicitud
+    if meters is not None:
+        query = f"?contours_meters={meters}"
+    elif mins is not None:
+        query = f"?contours_minutes={mins}"
+    else:
+        raise ValueError("Debes especificar 'mins' o 'meters'.")
+    
+    url = f"{base_url}{routing_profile}/{lon},{lat}{query}&polygons=true&denoise=1&access_token={access_token}"
+
+    # Realiza la solicitud a la API
+    response = requests.get(url)
+    response.raise_for_status()  # Lanza un error si la solicitud falla
+    
+    # Procesa los datos recibidos
+    geom = response.json()["features"][0]["geometry"]["coordinates"][0]
+
+    # Convierte las coordenadas a un DataFrame
+    coords = pd.DataFrame(geom, columns=["lon", "lat"])
+    return coords
+
+# PRUEBA DE LA FUNCIÓN
+test_coords = mapbox_isochrone(
+    base_url="https://api.mapbox.com/isochrone/v1/mapbox/",
+    routing_profile="walking",
+    lon=-99.184823289979, lat=19.33905855077223,
+    meters=500,
+    access_token="TU LLAVE"
+)
+
+print(test_coords)
+
+# CICLO PARA OBTENER ISÓCRONAS DE TODOS LOS CENTROS DE TRABAJO
+isochrone_list = []  # Lista para guardar las isócronas
+times = []  # Para estimar el tiempo de ejecución
+
+for idx, row in escuelas.iterrows():
+    start_time = time.time()
+    print(f"Obteniendo isócrona para la escuela {idx + 1} de {len(escuelas)}...")
+
+    try:
+        # Obtener isócrona
+        coords = mapbox_isochrone(
+            base_url="https://api.mapbox.com/isochrone/v1/mapbox/",
+            routing_profile="driving-traffic",
+            lon=row["LONGITUD"], lat=row["LATITUD"],
+            mins=30,  # Tiempo de conducción
+            access_token="TU LLAVE"
+        )
+        # Convertir a polígono y añadir a la lista
+        polygon = Polygon(coords.values)
+        isochrone_list.append({"CCT": row["CCT"], "geometry": polygon})
+    except Exception as e:
+        print(f"Error al obtener la isócrona para la escuela {idx + 1}: {e}")
+        continue
+
+    # Calcular tiempo restante
+    elapsed_time = time.time() - start_time
+    times.append(elapsed_time)
+    avg_time = sum(times) / len(times)
+    remaining_time = avg_time * (len(escuelas) - (idx + 1)) / 60
+    print(f"Tiempo estimado restante: {remaining_time:.2f} minutos")
+
+# CONVERTIR A UN GEODATAFRAME
+isochrones_gdf = gpd.GeoDataFrame(isochrone_list, crs="EPSG:4326")
+
+# UNIR RESULTADOS CON LA BASE ORIGINAL
+escuelas_gdf = gpd.GeoDataFrame(escuelas, geometry=None)
+escuelas_gdf["geometry"] = None
+
+for idx, row in escuelas_gdf.iterrows():
+    match = isochrones_gdf[isochrones_gdf["CCT"] == row["CCT"]]
+    if not match.empty:
+        escuelas_gdf.at[idx, "geometry"] = match["geometry"].values[0]
+
+# VISUALIZAR RESULTADOS CON FOLIUM
+m = folium.Map(location=[19.33905855077223, -99.184823289979], zoom_start=12)
+
+for _, row in escuelas_gdf.iterrows():
+    if row["geometry"] is not None:
+        folium.Polygon(
+            locations=[(p[1], p[0]) for p in list(row["geometry"].exterior.coords)],
+            color="blue",
+            weight=1
+        ).add_to(m)
+
+# Guardar resultados
+isochrones_gdf.to_file("primarias.shp")
+escuelas_gdf.to_file("escuelas_con_isocronas.shp")
+
+# Mostrar el mapa interactivo
+m.save("isocronas_escuelas.html")
